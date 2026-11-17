@@ -221,7 +221,7 @@ struct swapchain {
     int retired;
     /* OMA_ZERO_COPY_STATS */
     uint32_t frames;
-    int64_t t_report, wait_ns;
+    int64_t t_report, wait_ns, gpu_ns;
     struct swapchain *next;
 };
 
@@ -685,7 +685,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL oma_CreateSwapchainKHR(VkDevice device, co
     sc->mode = ci->presentMode == VK_PRESENT_MODE_MAILBOX_KHR || ci->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR
                    ? VK_PRESENT_MODE_MAILBOX_KHR
                    : VK_PRESENT_MODE_FIFO_KHR;
-    sc->count = ci->minImageCount < 3 ? 3 : ci->minImageCount > MAX_IMAGES ? MAX_IMAGES : ci->minImageCount;
+    /* Mailbox: the compositor can hold three at once (the one on screen, the one going off it till its release
+     * fence, the newest commit), so a fourth keeps the app drawing instead of waiting, as Mesa's own WSI does. */
+    uint32_t least = sc->mode == VK_PRESENT_MODE_MAILBOX_KHR ? 4 : 3;
+    sc->count = ci->minImageCount < least ? least : ci->minImageCount > MAX_IMAGES ? MAX_IMAGES : ci->minImageCount;
     uint32_t drm = ci->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR ? FORMATS[fmt].drm_opaque : FORMATS[fmt].drm;
 
     pthread_mutex_lock(&ws->lock);
@@ -834,6 +837,7 @@ static VkResult acquire(VkDevice device, VkSwapchainKHR handle, uint64_t timeout
         }
     }
     sc->wait_ns += now_ns() - t0;
+    if (stats && r == VK_TIMEOUT) say("acquire timed out: the compositor holds every image");
     pthread_mutex_unlock(&ws->lock);
     if (r == VK_SUCCESS) r = signal_now(d, sem, fence);
     return r;
@@ -851,9 +855,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL oma_AcquireNextImage2KHR(VkDevice device, 
 }
 
 /* Hands an image the GPU finished to the compositor. */
-static VkResult present_one(struct swapchain *sc, uint32_t index) {
+static VkResult present_one(struct swapchain *sc, uint32_t index, int64_t gpu_ns) {
     struct wsurface *ws = sc->ws;
     pthread_mutex_lock(&ws->lock);
+    sc->gpu_ns += gpu_ns;
     struct image *img = &sc->images[index];
     img->acquired = 0;
     if (sc->retired) {
@@ -882,10 +887,14 @@ static VkResult present_one(struct swapchain *sc, uint32_t index) {
         sc->frames++;
         int64_t t = now_ns();
         if (t - sc->t_report >= 2000000000LL) {
-            say("%.1f fps, waiting for the compositor %.2f ms per frame", sc->frames / ((t - sc->t_report) / 1e9),
-                sc->wait_ns / 1e6 / sc->frames);
+            uint32_t held = 0;
+            for (uint32_t i = 0; i < sc->count; i++) held += sc->images[i].busy;
+            say("%.1f fps, waiting for the compositor %.2f ms, for the GPU %.2f ms per frame, %u of %u images with it",
+                sc->frames / ((t - sc->t_report) / 1e9), sc->wait_ns / 1e6 / sc->frames, sc->gpu_ns / 1e6 / sc->frames,
+                held, sc->count);
             sc->frames = 0;
             sc->wait_ns = 0;
+            sc->gpu_ns = 0;
             sc->t_report = t;
         }
     }
@@ -917,6 +926,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL oma_QueuePresentKHR(VkQueue queue, const V
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     /* Stage 1: the frame is done before the compositor gets it. */
+    int64_t gpu_t0 = now_ns();
     if (info->waitSemaphoreCount) {
         VkPipelineStageFlags stages[16];
         uint32_t n = info->waitSemaphoreCount < 16 ? info->waitSemaphoreCount : 16;
@@ -932,9 +942,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL oma_QueuePresentKHR(VkQueue queue, const V
         pthread_mutex_unlock(&d->present_lock);
         if (r != VK_SUCCESS) return r;
     }
+    int64_t gpu_ns = now_ns() - gpu_t0;
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < info->swapchainCount; i++) {
-        VkResult r = present_one(swapchain_find(info->pSwapchains[i]), info->pImageIndices[i]);
+        VkResult r = present_one(swapchain_find(info->pSwapchains[i]), info->pImageIndices[i], i ? 0 : gpu_ns);
         if (info->pResults) info->pResults[i] = r;
         if (r < 0 && worst >= 0) worst = r;
     }
