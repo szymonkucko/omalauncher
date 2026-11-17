@@ -17,3 +17,6 @@ fastlane/README.md
 keystore.properties
 # captured by scripts/collage-captures.sh
 store/collage/raw/
+# zero-copy P0 guest client, built by scripts/zero-copy/build.sh
+app/src/debug/assets/zc/
+scripts/zero-copy/build/

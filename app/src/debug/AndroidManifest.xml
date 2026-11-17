@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only: the zero-copy P0 test (p0/ZeroCopyP0Activity.kt). Exported for adb's am start. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name="dev.omalauncher.p0.ZeroCopyP0Activity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode"
+            android:exported="true"
+            android:label="zero-copy P0"
+            android:launchMode="singleTask"
+            android:taskAffinity="dev.omalauncher.zc.p0"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+    </application>
+</manifest>

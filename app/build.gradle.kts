@@ -72,7 +72,12 @@ android {
 
     buildTypes {
         // en-XA and ar-XB: text that stays plain English or left-to-right there isn't in res/ yet.
-        debug { isPseudoLocalesEnabled = true }
+        debug {
+            isPseudoLocalesEnabled = true
+            // zero-copy P0: installs next to the store app, with its own Linux; builds the P0 test (app/src/debug).
+            applicationIdSuffix = ".zc"
+            externalNativeBuild { cmake { arguments += "-DOMA_ZC_P0=ON" } }
+        }
         release {
             // Shrinks the APK and drops what the app doesn't use, like the owl module's unused parts.
             isMinifyEnabled = true
