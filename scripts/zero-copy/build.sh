@@ -1,5 +1,5 @@
 #!/bin/sh
-# Zero-copy P0/P1: builds the guest client, oma-zc-client, for aarch64 Linux (glibc 2.35 and newer)
+# Zero-copy: builds the guest test client (oma-zc-client) and the Vulkan layer (VK_LAYER_OMA_zero_copy) for aarch64 Linux (glibc 2.35 and newer)
 # in a container and puts it into the debug assets, where ZeroCopyP0Activity copies it into the guest.
 # Needs docker with arm64 images (native on Apple silicon). The asset is gitignored; debug builds
 # without it still build, and the P0 activity says the client is missing.
@@ -20,7 +20,11 @@ docker run --rm --platform linux/arm64 -v "$root:/src" -w /src/scripts/zero-copy
   gcc -O2 -g -std=gnu11 -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter -D_GNU_SOURCE -include stdint.h \
       -I build -I /src/app/src/debug/cpp -o build/oma-zc-client zc_client.c \
       build/xdg-shell-protocol.c build/oma-ahb-v1-protocol.c -ldl -lwayland-client
-  file build/oma-zc-client'
+  gcc -O2 -g -std=gnu11 -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter -D_GNU_SOURCE \
+      -shared -fPIC -fvisibility=hidden -Wl,--no-undefined -I build -o build/libVkLayer_oma_zero_copy.so \
+      oma_zero_copy_layer.c build/oma-ahb-v1-protocol.c -lwayland-client -lpthread
+  file build/oma-zc-client build/libVkLayer_oma_zero_copy.so
+  nm -D --defined-only build/libVkLayer_oma_zero_copy.so | grep -i " T "'
 mkdir -p "$root/app/src/debug/assets/zc"
-cp "$out/oma-zc-client" "$root/app/src/debug/assets/zc/oma-zc-client"
-echo "copied to app/src/debug/assets/zc/oma-zc-client"
+cp "$out/oma-zc-client" "$out/libVkLayer_oma_zero_copy.so" "$here/oma_zero_copy_layer.json" "$root/app/src/debug/assets/zc/"
+echo "copied oma-zc-client and the Vulkan layer to app/src/debug/assets/zc/"

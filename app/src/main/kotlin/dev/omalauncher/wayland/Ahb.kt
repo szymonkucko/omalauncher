@@ -2,9 +2,28 @@ package dev.omalauncher.wayland
 
 import java.util.concurrent.atomic.AtomicInteger
 
-/** DRM fourccs of the formats offered: bytes R, G, B, A, as AHardwareBuffer's R8G8B8A8. */
+/** DRM fourccs of the formats offered: bytes R, G, B, A (AHardwareBuffer's R8G8B8A8), and B, G, R, A where gralloc has it. */
 internal const val DRM_FORMAT_ABGR8888 = 0x34324241
 internal const val DRM_FORMAT_XBGR8888 = 0x34324258
+internal const val DRM_FORMAT_ARGB8888 = 0x34325241
+internal const val DRM_FORMAT_XRGB8888 = 0x34325258
+
+/** AHardwareBuffer formats: R8G8B8A8_UNORM, and HAL_PIXEL_FORMAT_BGRA_8888, which the NDK doesn't name. */
+private const val AHB_RGBA = 1
+private const val AHB_BGRA = 5
+
+/** The DRM formats this device's allocator gives us, with their AHardwareBuffer format; found once. */
+private val formats: Map<Int, Int> by lazy {
+    buildMap {
+        put(DRM_FORMAT_ABGR8888, AHB_RGBA)
+        put(DRM_FORMAT_XBGR8888, AHB_RGBA)
+        // Zink renders GL into BGRA swapchains: without it, GL apps' frames are copied.
+        if (Native.ahbSupported(AHB_BGRA)) {
+            put(DRM_FORMAT_ARGB8888, AHB_BGRA)
+            put(DRM_FORMAT_XRGB8888, AHB_BGRA)
+        }
+    }
+}
 
 /** Largest width or height of a buffer, as for a pixel store. */
 private const val MAX_SIZE = 16384
@@ -20,6 +39,10 @@ class AhbAllocator(
     version: Int,
 ) : Resource(client, id, version) {
     override val iface = "oma_ahb_allocator_v1"
+
+    init {
+        for (format in formats.keys) send(event(2).uint(format))
+    }
 
     override fun request(
         opcode: Int,
@@ -37,13 +60,14 @@ class AhbAllocator(
         height: Int,
         format: Int,
     ) {
-        if (format != DRM_FORMAT_ABGR8888 && format != DRM_FORMAT_XBGR8888) return client.postError(id, INVALID_FORMAT, "format $format")
+        val ahbFormat = formats[format] ?: return client.postError(id, INVALID_FORMAT, "format $format")
         if (width !in 1..MAX_SIZE || height !in 1..MAX_SIZE) return client.postError(id, INVALID_SIZE, "size ${width}x$height")
         val info = IntArray(3)
         // A few milliseconds under the server lock, a handful of times per window: not worth deferring.
-        val ahb = Native.ahbAllocate(width, height, info)
+        val ahb = Native.ahbAllocate(width, height, ahbFormat, info)
         // Registered either way: the id is the client's, and a failed buffer still needs destroying.
-        client.register(AhbBuffer(client, bufferId, ahb, width, height, opaque = format == DRM_FORMAT_XBGR8888))
+        val opaque = format == DRM_FORMAT_XBGR8888 || format == DRM_FORMAT_XRGB8888
+        client.register(AhbBuffer(client, bufferId, ahb, width, height, opaque))
         if (ahb == 0L) return send(event(1).obj(bufferId))
         // fd, offset, stride, modifier (linear: 0, 0); the fd isn't part of the message body.
         send(event(0).obj(bufferId).fd(info[0], close = true).uint(info[1]).uint(info[2]).uint(0).uint(0))
@@ -65,7 +89,7 @@ class AhbBuffer(
     ahb: Long,
     val width: Int,
     val height: Int,
-    /** XBGR: alpha is to be ignored. */
+    /** An X format: alpha is to be ignored. */
     val opaque: Boolean,
 ) : Resource(client, id, 1) {
     override val iface = "wl_buffer"

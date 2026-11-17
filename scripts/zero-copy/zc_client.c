@@ -283,7 +283,11 @@ static void on_failed(void *data, struct oma_ahb_allocator_v1 *a, struct wl_buff
     wl.answered++;
 }
 
-static const struct oma_ahb_allocator_v1_listener allocator_listener = {on_allocated, on_failed};
+static void on_format(void *data, struct oma_ahb_allocator_v1 *a, uint32_t format) {
+    LOG("compositor format %.4s", (const char *)&format);
+}
+
+static const struct oma_ahb_allocator_v1_listener allocator_listener = {on_allocated, on_failed, on_format};
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t version) {
     if (!strcmp(iface, wl_compositor_interface.name)) {

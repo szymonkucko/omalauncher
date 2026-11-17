@@ -21,6 +21,8 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, WL_TAG, __VA_ARGS__)
 
 #define MAX_HANDLE_FDS 8
+// HAL_PIXEL_FORMAT_BGRA_8888: grallocs have it, the NDK's AHardwareBuffer formats don't name it.
+#define FORMAT_B8G8R8A8 5
 #define USAGE                                                                                                    \
     (AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |                          \
      AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY)
@@ -62,15 +64,27 @@ static int handle_fds(AHardwareBuffer *ahb, int *fds, int max) {
     return count;
 }
 
-// Allocates a width x height RGBA buffer the GPU renders into and the display
-// shows. info gets the dma-buf with its pixels (an fd the caller owns), the
-// offset and bytes per row. Returns the AHardwareBuffer, 0 on failure.
-JNIEXPORT jlong JNICALL FN(ahbAllocate)(JNIEnv *env, jclass cls, jint width, jint height, jintArray jinfo) {
+// Whether buffers of an AHardwareBuffer format can be had with our usage: 1 (RGBA) always, 5 (BGRA) not everywhere.
+JNIEXPORT jboolean JNICALL FN(ahbSupported)(JNIEnv *env, jclass cls, jint format) {
+    AHardwareBuffer_Desc want = {.width = 64, .height = 64, .layers = 1, .format = (uint32_t) format, .usage = USAGE};
+    if (!AHardwareBuffer_isSupported(&want)) return JNI_FALSE;
+    // isSupported answers from the allocator's mapper, which may not know a format the NDK doesn't list: try one.
+    AHardwareBuffer *ahb = NULL;
+    if (AHardwareBuffer_allocate(&want, &ahb) || !ahb) return JNI_FALSE;
+    AHardwareBuffer_release(ahb);
+    return JNI_TRUE;
+}
+
+// Allocates a width x height buffer of an AHardwareBuffer format (1 RGBA, 5
+// BGRA) the GPU renders into and the display shows. info gets the dma-buf with
+// its pixels (an fd the caller owns), the offset and bytes per row. Returns
+// the AHardwareBuffer, 0 on failure.
+JNIEXPORT jlong JNICALL FN(ahbAllocate)(JNIEnv *env, jclass cls, jint width, jint height, jint format, jintArray jinfo) {
     AHardwareBuffer_Desc want = {
         .width = (uint32_t) width,
         .height = (uint32_t) height,
         .layers = 1,
-        .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+        .format = (uint32_t) format,
         // CPU read keeps gralloc linear (MediaTek's would pick AFBC, which the guest can't import as such)
         // and lets a window that can't show the buffer as a layer copy it instead.
         .usage = USAGE,
@@ -122,7 +136,19 @@ JNIEXPORT void JNICALL FN(windowBlitAhb)(JNIEnv *env, jclass cls, jlong window, 
     AHardwareBuffer_describe(b, &desc);
     void *px = NULL;
     if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, NULL, &px) || !px) return;
-    wl_blit(win, px, (int) desc.width, (int) desc.height, (int) desc.stride, !opaque, dx, dy, dw, dh, opaque);
+    uint32_t *rgba = NULL;
+    if (desc.format == FORMAT_B8G8R8A8) {
+        // The window and the blit are RGBA: swap red and blue first. Only on this slow path; overlays take BGRA as is.
+        size_t n = (size_t) desc.stride * desc.height;
+        rgba = malloc(n * 4);
+        if (rgba) {
+            const uint32_t *s = px;
+            for (size_t i = 0; i < n; i++) rgba[i] = (s[i] & 0xff00ff00u) | ((s[i] & 0xffu) << 16) | ((s[i] >> 16) & 0xffu);
+        }
+    }
+    if (desc.format != FORMAT_B8G8R8A8 || rgba)
+        wl_blit(win, rgba ? rgba : px, (int) desc.width, (int) desc.height, (int) desc.stride, !opaque, dx, dy, dw, dh, opaque);
+    free(rgba);
     AHardwareBuffer_unlock(b, NULL);
 }
 

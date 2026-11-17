@@ -52,8 +52,11 @@ object Native {
 
     // AHardwareBuffers, see cpp/ahb.c and Ahb.kt.
 
-    /** A [width] x [height] RGBA buffer; [info] gets its pixels' dma-buf fd (ours to close), offset and bytes per row. 0 on failure. */
-    @JvmStatic external fun ahbAllocate(width: Int, height: Int, info: IntArray): Long
+    /** Whether buffers of AHardwareBuffer [format] (1 RGBA, 5 BGRA) can be allocated for clients here. */
+    @JvmStatic external fun ahbSupported(format: Int): Boolean
+
+    /** A [width] x [height] buffer of AHardwareBuffer [format]; [info] gets its pixels' dma-buf fd (ours to close), offset and bytes per row. 0 on failure. */
+    @JvmStatic external fun ahbAllocate(width: Int, height: Int, format: Int, info: IntArray): Long
 
     @JvmStatic external fun ahbRelease(ahb: Long)
 
