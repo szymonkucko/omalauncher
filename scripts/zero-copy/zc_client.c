@@ -10,10 +10,16 @@
  *                  imported memory bound as a VkBuffer (works whenever buffer import does)
  *   --path auto    image, and buffer if image import fails (default)
  *
+ * --wayland (P1): no P0 socket. The client is a Wayland window instead: it gets its buffers from the
+ * compositor's oma_ahb_allocator_v1 (oma-ahb-v1.xml) and presents them with wl_surface.attach/commit,
+ * paced by frame callbacks, as a Vulkan swapchain on OmaLauncher would.
+ *
  * Vulkan comes from the guest's loader (libvulkan.so.1, with OmaLauncher's VK_DRIVER_FILES),
  * or straight from a driver with --icd /path/libvulkan_xxx.so.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
 #include <errno.h>
@@ -21,6 +27,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -28,7 +35,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
+#include <wayland-client.h>
 
+#include "oma-ahb-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 #include "zc_proto.h"
 #include "zc_frag.h"
 #include "zc_vert.h"
@@ -85,7 +95,11 @@ static struct {
     int foreign;
     int has_modifier;
     uint64_t modifier; /* --modifier: import with this instead of the launcher's (e.g. a compressed layout) */
-} opt = {.frames = 600, .want_path = ZC_PATH_NONE, .device_index = -1, .foreign = 1};
+    int wayland;
+    int nbuf;   /* --buffers, Wayland only */
+    int opaque; /* --opaque: XBGR8888 instead of ABGR8888, Wayland only */
+    int shm_over; /* --shm-over N: a wl_shm subsurface over the window, shown and hidden every N frames */
+} opt = {.frames = 600, .want_path = ZC_PATH_NONE, .device_index = -1, .foreign = 1, .nbuf = 3};
 
 static int sock = -1;
 static struct zc_hello hello;
@@ -193,6 +207,261 @@ static int connect_launcher(void) {
             b.index, b.width, b.height, b.stride_px, b.stride_bytes, b.offset, (unsigned long long)b.dmabuf_size,
             (long long)size, kind, (unsigned long long)b.modifier, (unsigned long long)b.usage, b.fd_index, b.handle_fds);
     }
+    return 0;
+}
+
+
+/* ---- Wayland (--wayland) ---- */
+
+static int render(uint32_t idx, uint32_t frame);
+
+#define DRM_FORMAT_ABGR8888 0x34324241u
+#define DRM_FORMAT_XBGR8888 0x34324258u
+
+static struct {
+    struct wl_display *display;
+    struct wl_compositor *compositor;
+    struct wl_subcompositor *subcompositor;
+    struct wl_shm *shm;
+    struct xdg_wm_base *wm;
+    struct oma_ahb_allocator_v1 *allocator;
+    struct wl_output *output;
+    int32_t scale;
+    struct wl_surface *surface;
+    struct xdg_surface *xdg;
+    struct xdg_toplevel *toplevel;
+    int32_t width, height; /* logical, from the last configure with a size */
+    int configured, closed;
+    struct wl_buffer *buffers[ZC_MAX_BUFS];
+    int answered, failed;
+    int frame_pending;
+    uint32_t free_mask;
+    struct wl_surface *over; /* --shm-over */
+    struct wl_buffer *over_buffer;
+} wl = {.scale = 1};
+
+static void wm_ping(void *data, struct xdg_wm_base *wm, uint32_t serial) { xdg_wm_base_pong(wm, serial); }
+static const struct xdg_wm_base_listener wm_listener = {.ping = wm_ping};
+
+static void output_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph, int32_t sub,
+                            const char *make, const char *model, int32_t transform) {}
+static void output_mode(void *d, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t refresh) {
+    LOG("output: %dx%d %.1f Hz", w, h, refresh / 1000.0);
+}
+static void output_done(void *d, struct wl_output *o) {}
+static void output_scale(void *d, struct wl_output *o, int32_t factor) { wl.scale = factor > 0 ? factor : 1; }
+static const struct wl_output_listener output_listener = {output_geometry, output_mode, output_done, output_scale};
+
+static void on_allocated(void *data, struct oma_ahb_allocator_v1 *a, struct wl_buffer *buffer, int32_t fd, uint32_t offset,
+                         uint32_t stride, uint32_t mod_hi, uint32_t mod_lo) {
+    for (uint32_t i = 0; i < hello.nbuf; i++) {
+        if (wl.buffers[i] != buffer) continue;
+        struct zc_buffer *b = &bufs[i];
+        memset(b, 0, sizeof(*b));
+        b->index = i;
+        b->width = hello.width;
+        b->height = hello.height;
+        b->drm_format = opt.opaque ? DRM_FORMAT_XBGR8888 : DRM_FORMAT_ABGR8888;
+        b->stride_bytes = stride;
+        b->stride_px = stride / 4;
+        b->offset = offset;
+        b->modifier = (uint64_t)mod_hi << 32 | mod_lo;
+        off_t size = lseek(fd, 0, SEEK_END);
+        b->dmabuf_size = size > 0 ? (uint64_t)size : 0;
+        buf_fd[i] = fd;
+        LOG("buffer %u: %ux%u stride %u B offset %u, dma-buf %llu B, modifier %#llx", i, b->width, b->height, stride,
+            offset, (unsigned long long)b->dmabuf_size, (unsigned long long)b->modifier);
+        wl.answered++;
+        return;
+    }
+    close(fd);
+}
+
+static void on_failed(void *data, struct oma_ahb_allocator_v1 *a, struct wl_buffer *buffer) {
+    LOG("FAIL the compositor could not allocate a buffer");
+    wl.failed++;
+    wl.answered++;
+}
+
+static const struct oma_ahb_allocator_v1_listener allocator_listener = {on_allocated, on_failed};
+
+static void registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t version) {
+    if (!strcmp(iface, wl_compositor_interface.name)) {
+        wl.compositor = wl_registry_bind(reg, name, &wl_compositor_interface, version < 4 ? version : 4);
+    } else if (!strcmp(iface, wl_subcompositor_interface.name)) {
+        wl.subcompositor = wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
+    } else if (!strcmp(iface, wl_shm_interface.name)) {
+        wl.shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    } else if (!strcmp(iface, xdg_wm_base_interface.name)) {
+        wl.wm = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(wl.wm, &wm_listener, NULL);
+    } else if (!strcmp(iface, oma_ahb_allocator_v1_interface.name)) {
+        wl.allocator = wl_registry_bind(reg, name, &oma_ahb_allocator_v1_interface, 1);
+        oma_ahb_allocator_v1_add_listener(wl.allocator, &allocator_listener, NULL);
+    } else if (!strcmp(iface, wl_output_interface.name) && !wl.output && version >= 2) {
+        wl.output = wl_registry_bind(reg, name, &wl_output_interface, 2);
+        wl_output_add_listener(wl.output, &output_listener, NULL);
+    }
+}
+static void registry_remove(void *data, struct wl_registry *reg, uint32_t name) {}
+static const struct wl_registry_listener registry_listener = {registry_global, registry_remove};
+
+static void xdg_configure(void *data, struct xdg_surface *xdg, uint32_t serial) {
+    xdg_surface_ack_configure(xdg, serial);
+    wl.configured = 1;
+}
+static const struct xdg_surface_listener xdg_listener = {xdg_configure};
+
+static void toplevel_configure(void *data, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *states) {
+    if (w > 0 && h > 0) {
+        if (wl.width && (w != wl.width || h != wl.height)) LOG("resized to %dx%d (not followed: the compositor scales)", w, h);
+        else if (!wl.width) LOG("window: %dx%d", w, h);
+        if (!wl.width) wl.width = w, wl.height = h;
+    }
+}
+static void toplevel_close(void *data, struct xdg_toplevel *t) { wl.closed = 1; }
+static const struct xdg_toplevel_listener toplevel_listener = {toplevel_configure, toplevel_close};
+
+static void buffer_release(void *data, struct wl_buffer *buffer) { wl.free_mask |= 1u << (uint32_t)(uintptr_t)data; }
+static const struct wl_buffer_listener buffer_listener = {buffer_release};
+
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
+    wl_callback_destroy(cb);
+    wl.frame_pending = 0;
+}
+static const struct wl_callback_listener frame_listener = {frame_done};
+
+/* Opens a window and gets its buffers from the compositor: fills hello, bufs and buf_fd as the P0 socket would. */
+static int connect_wayland(void) {
+    wl.display = wl_display_connect(NULL);
+    if (!wl.display) {
+        LOG("FAIL wl_display_connect (WAYLAND_DISPLAY=%s)", getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "");
+        return -1;
+    }
+    wl_registry_add_listener(wl_display_get_registry(wl.display), &registry_listener, NULL);
+    wl_display_roundtrip(wl.display);
+    wl_display_roundtrip(wl.display);
+    if (!wl.compositor || !wl.wm) {
+        LOG("FAIL no wl_compositor or xdg_wm_base");
+        return -1;
+    }
+    if (!wl.allocator) {
+        LOG("FAIL the compositor has no oma_ahb_allocator_v1");
+        return -1;
+    }
+    wl.surface = wl_compositor_create_surface(wl.compositor);
+    wl.xdg = xdg_wm_base_get_xdg_surface(wl.wm, wl.surface);
+    xdg_surface_add_listener(wl.xdg, &xdg_listener, NULL);
+    wl.toplevel = xdg_surface_get_toplevel(wl.xdg);
+    xdg_toplevel_add_listener(wl.toplevel, &toplevel_listener, NULL);
+    xdg_toplevel_set_title(wl.toplevel, "oma-zc-client");
+    xdg_toplevel_set_app_id(wl.toplevel, "oma-zc-client");
+    wl_surface_commit(wl.surface);
+    /* OmaLauncher sizes a window once its activity is laid out: a 0x0 configure may come first. */
+    int64_t until = now_ns() + 5000000000LL;
+    while ((!wl.configured || !wl.width) && now_ns() < until) {
+        if (wl_display_roundtrip(wl.display) < 0) return -1;
+        if (!wl.width) usleep(50000);
+    }
+    if (!wl.width) {
+        LOG("no size from the compositor, using 540x960");
+        wl.width = 540, wl.height = 960;
+    }
+    hello.nbuf = (uint32_t)(opt.nbuf < 2 ? 2 : opt.nbuf > ZC_MAX_BUFS ? ZC_MAX_BUFS : opt.nbuf);
+    hello.width = (uint32_t)(wl.width * wl.scale);
+    hello.height = (uint32_t)(wl.height * wl.scale);
+    LOG("window %dx%d at scale %d: %u buffers of %ux%u", wl.width, wl.height, wl.scale, hello.nbuf, hello.width, hello.height);
+    for (uint32_t i = 0; i < hello.nbuf; i++) {
+        wl.buffers[i] = oma_ahb_allocator_v1_allocate(wl.allocator, (int32_t)hello.width, (int32_t)hello.height,
+                                                      opt.opaque ? DRM_FORMAT_XBGR8888 : DRM_FORMAT_ABGR8888, 0);
+        wl_buffer_add_listener(wl.buffers[i], &buffer_listener, (void *)(uintptr_t)i);
+    }
+    while (wl.answered < (int)hello.nbuf)
+        if (wl_display_roundtrip(wl.display) < 0) return -1;
+    if (wl.failed) return -1;
+    wl.free_mask = (1u << hello.nbuf) - 1;
+    wl_surface_set_buffer_scale(wl.surface, wl.scale);
+    return 0;
+}
+
+/* A translucent shm square as a subsurface over the window: the compositor can't show the buffer beneath as a
+ * layer of its own then, and copies it into the window instead. */
+static int make_over(void) {
+    const int size = 300 * wl.scale, stride = size * 4;
+    int fd = memfd_create("zc-over", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, (off_t)stride * size)) return -1;
+    uint32_t *px = mmap(NULL, (size_t)stride * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) return -1;
+    /* ARGB8888, premultiplied: half-transparent blue with a white frame. */
+    for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++)
+            px[y * size + x] = (x < 8 || y < 8 || x >= size - 8 || y >= size - 8) ? 0xffffffffu : 0x80000080u;
+    munmap(px, (size_t)stride * size);
+    struct wl_shm_pool *pool = wl_shm_create_pool(wl.shm, fd, stride * size);
+    wl.over_buffer = wl_shm_pool_create_buffer(pool, 0, size, size, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    wl.over = wl_compositor_create_surface(wl.compositor);
+    wl_surface_set_buffer_scale(wl.over, wl.scale);
+    struct wl_subsurface *sub = wl_subcompositor_get_subsurface(wl.subcompositor, wl.over, wl.surface);
+    wl_subsurface_set_position(sub, 100, 100);
+    wl_subsurface_set_desync(sub);
+    return 0;
+}
+
+static void show_over(int show) {
+    wl_surface_attach(wl.over, show ? wl.over_buffer : NULL, 0, 0);
+    if (show) wl_surface_damage_buffer(wl.over, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(wl.over);
+    LOG("shm subsurface %s", show ? "shown" : "hidden");
+}
+
+static int run_wayland(void) {
+    if (opt.shm_over > 0 && (!wl.subcompositor || !wl.shm || make_over())) {
+        LOG("FAIL --shm-over: no wl_subcompositor or wl_shm, or no memory");
+        return -1;
+    }
+    int64_t t_start = now_ns(), t_report = t_start, render_sum = 0, wait_sum = 0;
+    uint32_t window = 0, next = 0, frame;
+    for (frame = 0; opt.frames <= 0 || frame < (uint32_t)opt.frames; frame++) {
+        int64_t tw = now_ns();
+        /* A free buffer, and the compositor showed the last frame (or it's the first). */
+        while (!wl.closed && (!wl.free_mask || wl.frame_pending))
+            if (wl_display_dispatch(wl.display) < 0) {
+                LOG("the compositor went away");
+                return -1;
+            }
+        if (wl.closed) {
+            LOG("window closed");
+            break;
+        }
+        uint32_t idx = next;
+        while (!(wl.free_mask & (1u << idx))) idx = (idx + 1) % hello.nbuf;
+        next = (idx + 1) % hello.nbuf;
+        wl.free_mask &= ~(1u << idx);
+        int64_t t0 = now_ns();
+        if (render(idx, frame)) return -1;
+        int64_t t1 = now_ns();
+        if (opt.shm_over > 0 && frame % (uint32_t)opt.shm_over == 0) show_over((frame / (uint32_t)opt.shm_over) % 2 == 0);
+        struct wl_callback *cb = wl_surface_frame(wl.surface);
+        wl_callback_add_listener(cb, &frame_listener, NULL);
+        wl.frame_pending = 1;
+        wl_surface_attach(wl.surface, wl.buffers[idx], 0, 0);
+        wl_surface_damage_buffer(wl.surface, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_commit(wl.surface);
+        wl_display_flush(wl.display);
+        render_sum += t1 - t0;
+        wait_sum += t0 - tw;
+        window++;
+        if (t1 - t_report > 2000000000LL) {
+            LOG("frame %u: %.1f fps, render+wait %.2f ms avg, waiting for a buffer/frame %.2f ms avg", frame,
+                window / ((t1 - t_report) / 1e9), render_sum / 1e6 / window, wait_sum / 1e6 / window);
+            t_report = t1;
+            render_sum = wait_sum = 0;
+            window = 0;
+        }
+    }
+    LOG("done: %u frames in %.1f s", frame, (now_ns() - t_start) / 1e9);
     return 0;
 }
 
@@ -767,7 +1036,8 @@ static int run(void) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --socket PATH [--frames N (0: until the launcher goes)] [--path auto|image|buffer]\n"
+            "usage: %s --socket PATH | --wayland [--buffers 2-4] [--opaque] [--shm-over FRAMES]\n"
+            "          [--frames N (0: until the launcher goes)] [--path auto|image|buffer]\n"
             "          [--icd /path/libvulkan_driver.so] [--device N] [--no-foreign] [--modifier 0x...]\n",
             argv0);
 }
@@ -782,6 +1052,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--frames") && v) opt.frames = atoi(v), i++;
         else if (!strcmp(a, "--device") && v) opt.device_index = atoi(v), i++;
         else if (!strcmp(a, "--no-foreign")) opt.foreign = 0;
+        else if (!strcmp(a, "--wayland")) opt.wayland = 1;
+        else if (!strcmp(a, "--opaque")) opt.opaque = 1;
+        else if (!strcmp(a, "--buffers") && v) opt.nbuf = atoi(v), i++;
+        else if (!strcmp(a, "--shm-over") && v) opt.shm_over = atoi(v), i++;
         else if (!strcmp(a, "--modifier") && v) opt.has_modifier = 1, opt.modifier = strtoull(v, NULL, 0), i++;
         else if (!strcmp(a, "--path") && v) {
             opt.want_path = !strcmp(v, "image") ? ZC_PATH_IMAGE : !strcmp(v, "buffer") ? ZC_PATH_BUFFER : ZC_PATH_NONE;
@@ -791,21 +1065,28 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!opt.socket_path) {
+    if (!opt.socket_path && !opt.wayland) {
         usage(argv[0]);
         return 2;
     }
-    if (connect_launcher() || load_vulkan() || create_device()) return 1;
+    if ((opt.wayland ? connect_wayland() : connect_launcher()) || load_vulkan() || create_device()) return 1;
     probe_formats();
     int imported = import_all();
-    struct zc_ready ready = {{ZC_MSG_READY, sizeof(ready)}, imported == 0, (uint32_t)path, ""};
-    snprintf(ready.device, sizeof(ready.device), "%s", device_name);
-    send_packet(&ready, sizeof(ready));
+    if (!opt.wayland) {
+        struct zc_ready ready = {{ZC_MSG_READY, sizeof(ready)}, imported == 0, (uint32_t)path, ""};
+        snprintf(ready.device, sizeof(ready.device), "%s", device_name);
+        send_packet(&ready, sizeof(ready));
+    }
     if (imported) {
         LOG("FAIL no import path worked");
         return 1;
     }
     if (create_pipeline()) return 1;
+    if (opt.wayland) {
+        int r = run_wayland();
+        vkDeviceWaitIdle(dev);
+        return r ? 1 : 0;
+    }
     int r = run();
     struct zc_bye bye = {{ZC_MSG_BYE, sizeof(bye)}, (uint32_t)(r ? 1 : 0)};
     send_packet(&bye, sizeof(bye));
