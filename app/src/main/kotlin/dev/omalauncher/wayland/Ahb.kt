@@ -1,8 +1,9 @@
 package dev.omalauncher.wayland
 
+import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 
-/** DRM fourccs of the formats offered: bytes R, G, B, A (AHardwareBuffer's R8G8B8A8), and B, G, R, A where gralloc has it. */
+/** DRM fourccs of the formats offered: bytes R, G, B, A (AHardwareBuffer's R8G8B8A8), and B, G, R, A where that's safe. */
 internal const val DRM_FORMAT_ABGR8888 = 0x34324241
 internal const val DRM_FORMAT_XBGR8888 = 0x34324258
 internal const val DRM_FORMAT_ARGB8888 = 0x34325241
@@ -17,8 +18,10 @@ private val formats: Map<Int, Int> by lazy {
     buildMap {
         put(DRM_FORMAT_ABGR8888, AHB_RGBA)
         put(DRM_FORMAT_XBGR8888, AHB_RGBA)
-        // Zink renders GL into BGRA swapchains: without it, GL apps' frames are copied.
-        if (Native.ahbSupported(AHB_BGRA)) {
+        // Zink renders GL into BGRA swapchains: without it, GL apps' frames are copied. Only with an Adreno GPU: on
+        // Mali (Seeker), SurfaceFlinger aborts when it draws a BGRA buffer itself (a screenshot, an animation), which
+        // restarts the phone's whole UI. Gralloc allocating one doesn't tell.
+        if (File("/dev/kgsl-3d0").exists() && Native.ahbSupported(AHB_BGRA)) {
             put(DRM_FORMAT_ARGB8888, AHB_BGRA)
             put(DRM_FORMAT_XRGB8888, AHB_BGRA)
         }

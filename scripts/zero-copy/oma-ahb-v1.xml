@@ -54,7 +54,8 @@
     <event name="format">
       <description summary="a format allocate takes">
         Sent for each format right after the allocator is bound: ABGR8888 and XBGR8888 (bytes R, G,
-        B, A) always, ARGB8888 and XRGB8888 (bytes B, G, R, A) where the device's allocator has them.
+        B, A) always, ARGB8888 and XRGB8888 (bytes B, G, R, A) where the device's allocator has them and
+        the system composes them safely (Adreno so far).
         The X formats are shown opaque, whatever is in their alpha.
       </description>
       <arg name="format" type="uint" summary="DRM fourcc"/>
