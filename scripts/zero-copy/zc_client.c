@@ -99,6 +99,7 @@ static struct {
     int nbuf;   /* --buffers, Wayland only */
     int opaque; /* --opaque: XBGR8888 instead of ABGR8888, Wayland only */
     int shm_over; /* --shm-over N: a wl_shm subsurface over the window, shown and hidden every N frames */
+    const char *app_id; /* --app-id ID: e.g. a home screen tile's (omarchy.tile-N), to land in that tile */
 } opt = {.frames = 600, .want_path = ZC_PATH_NONE, .device_index = -1, .foreign = 1, .nbuf = 3};
 
 static int sock = -1;
@@ -359,7 +360,7 @@ static int connect_wayland(void) {
     wl.toplevel = xdg_surface_get_toplevel(wl.xdg);
     xdg_toplevel_add_listener(wl.toplevel, &toplevel_listener, NULL);
     xdg_toplevel_set_title(wl.toplevel, "oma-zc-client");
-    xdg_toplevel_set_app_id(wl.toplevel, "oma-zc-client");
+    xdg_toplevel_set_app_id(wl.toplevel, opt.app_id ? opt.app_id : "oma-zc-client");
     wl_surface_commit(wl.surface);
     /* OmaLauncher sizes a window once its activity is laid out: a 0x0 configure may come first. */
     int64_t until = now_ns() + 5000000000LL;
@@ -1040,7 +1041,7 @@ static int run(void) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --socket PATH | --wayland [--buffers 2-4] [--opaque] [--shm-over FRAMES]\n"
+            "usage: %s --socket PATH | --wayland [--buffers 2-4] [--opaque] [--shm-over FRAMES] [--app-id ID]\n"
             "          [--frames N (0: until the launcher goes)] [--path auto|image|buffer]\n"
             "          [--icd /path/libvulkan_driver.so] [--device N] [--no-foreign] [--modifier 0x...]\n",
             argv0);
@@ -1060,6 +1061,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--opaque")) opt.opaque = 1;
         else if (!strcmp(a, "--buffers") && v) opt.nbuf = atoi(v), i++;
         else if (!strcmp(a, "--shm-over") && v) opt.shm_over = atoi(v), i++;
+        else if (!strcmp(a, "--app-id") && v) opt.app_id = v, i++;
         else if (!strcmp(a, "--modifier") && v) opt.has_modifier = 1, opt.modifier = strtoull(v, NULL, 0), i++;
         else if (!strcmp(a, "--path") && v) {
             opt.want_path = !strcmp(v, "image") ? ZC_PATH_IMAGE : !strcmp(v, "buffer") ? ZC_PATH_BUFFER : ZC_PATH_NONE;
