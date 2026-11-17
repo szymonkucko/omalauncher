@@ -20,3 +20,5 @@ store/collage/raw/
 # zero-copy P0 guest client, built by scripts/zero-copy/build.sh
 app/src/debug/assets/zc/
 scripts/zero-copy/build/
+# graft's local graph cache, regenerable, not committed
+/graft/
