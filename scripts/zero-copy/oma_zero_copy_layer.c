@@ -129,7 +129,7 @@ struct wsurface {
     struct oma_ahb_allocator_v1 *allocator;
     int rgba, bgra;             /* the compositor allocates R8G8B8A8 / B8G8R8A8 buffers (format events) */
     struct swapchain *building; /* the swapchain whose buffers are being allocated */
-    int frame_pending;          /* FIFO: the last commit's frame callback hasn't come */
+    struct wl_callback *frame;  /* FIFO: the last commit's frame callback, until it's done */
     struct wsurface *next;
 };
 
@@ -288,7 +288,8 @@ static void buffer_release(void *data, struct wl_buffer *buffer) { ((struct imag
 static const struct wl_buffer_listener buffer_listener = {buffer_release};
 
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
-    ((struct wsurface *)data)->frame_pending = 0;
+    struct wsurface *ws = data;
+    if (ws->frame == cb) ws->frame = NULL;
     wl_callback_destroy(cb);
 }
 
@@ -414,6 +415,8 @@ static struct wsurface *ours(VkSurfaceKHR surface, VkPhysicalDevice pd) {
 }
 
 static void surface_free(struct wsurface *ws) {
+    /* A hidden window's last frame callback never comes: it would outlive its queue. */
+    if (ws->frame) wl_callback_destroy(ws->frame);
     if (ws->allocator) oma_ahb_allocator_v1_destroy(ws->allocator);
     if (ws->surface_wrapper) wl_proxy_wrapper_destroy(ws->surface_wrapper);
     if (ws->display_wrapper) wl_proxy_wrapper_destroy(ws->display_wrapper);
@@ -862,12 +865,12 @@ static VkResult present_one(struct swapchain *sc, uint32_t index) {
         /* One frame per display frame: the last one is on screen first. A hidden window gets no frame
          * callbacks; then one frame a second, rather than none. */
         int64_t deadline = now_ns() + 1000000000LL;
-        while (ws->frame_pending)
+        while (ws->frame)
             if (wait_events(ws, deadline) != 0) break;
-        ws->frame_pending = 0;
-        struct wl_callback *cb = wl_surface_frame(ws->surface_wrapper);
-        wl_callback_add_listener(cb, &frame_listener, ws);
-        ws->frame_pending = 1;
+        /* Timed out: that callback may never come; a late one mustn't count for the next frame. */
+        if (ws->frame) wl_callback_destroy(ws->frame);
+        ws->frame = wl_surface_frame(ws->surface_wrapper);
+        wl_callback_add_listener(ws->frame, &frame_listener, ws);
     }
     sc->wait_ns += now_ns() - t0;
     wl_surface_attach(ws->surface_wrapper, img->buffer, 0, 0);
